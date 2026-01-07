@@ -2,8 +2,8 @@
 from __future__ import annotations
 import os
 import random
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional
 
 import numpy as np
 import chess
@@ -12,15 +12,18 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+# multiprocessing
+import multiprocessing as mp
+
 from core import (
     PVNet, ReplayBuffer, Sample,
-    MOVE_SPACE_SIZE, board_to_tensor, result_white,
+    board_to_tensor, result_white,
     mcts_search, visits_to_policy, index_to_move
 )
 
 @dataclass
 class Config:
-    device: str = "cpu"          # "cuda" om du har NVIDIA
+    device: str = "cpu"          # "cuda" om du har NVIDIA (rekommenderar workers=0 då)
     lr: float = 1e-3
     weight_decay: float = 1e-4
     batch_size: int = 256
@@ -55,6 +58,11 @@ class Config:
     log_every: int = 20
     save_last_pgn: bool = False
     pgn_path: str = "last_game.pgn"
+
+    # multiprocessing (självspel i parallell)
+    workers: int = 0               # 0 = av (single-process). 2/4/8 på CPU.
+    mp_start_method: str = "spawn" # "spawn" funkar på Windows; "fork" på Linux.
+    mp_chunk_games: int = 2        # hur många games per worker-jobb (minska overhead)
 
 class UCIEngine:
     def __init__(self, path: str, depth: int):
@@ -102,7 +110,7 @@ def _maybe_save_last_pgn(cfg: Config, moves_uci: List[str]):
     except Exception:
         pass
 
-def self_play_game(model: PVNet, cfg: Config) -> List[Sample]:
+def self_play_game(model: PVNet, cfg: Config, save_pgn: bool = False) -> List[Sample]:
     board = chess.Board()
     states, pis, turns = [], [], []
     moves_uci = []
@@ -133,7 +141,8 @@ def self_play_game(model: PVNet, cfg: Config) -> List[Sample]:
         moves_uci.append(move.uci())
         board.push(move)
 
-    _maybe_save_last_pgn(cfg, moves_uci)
+    if save_pgn:
+        _maybe_save_last_pgn(cfg, moves_uci)
 
     zw = result_white(board)
     samples: List[Sample] = []
@@ -179,24 +188,107 @@ def game_vs_engine(model: PVNet, cfg: Config, engine: UCIEngine) -> List[Sample]
     z = zw if our_color == chess.WHITE else -zw
     return [(s, pi, float(z)) for (s, pi) in saved]
 
-def generate_samples(model: PVNet, cfg: Config) -> List[Sample]:
+# -------- multiprocessing worker (måste vara top-level för pickle) --------
+def _worker_generate_samples(args):
+    """
+    args: (state_dict_cpu, cfg_dict, n_games, seed, allow_engine)
+    Körs i separat process på CPU.
+    """
+    state_dict, cfg_dict, n_games, seed, allow_engine = args
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    cfg = Config(**cfg_dict)
+    cfg.device = "cpu"  # workers kör CPU
+
+    model = PVNet()
+    model.load_state_dict(state_dict)
     model.eval()
+
     out: List[Sample] = []
 
     engine = None
     engine_path = cfg.uci_engine_path or os.getenv("UCI_ENGINE_PATH", "")
-    if cfg.sparring_ratio > 0 and engine_path:
+    if allow_engine and cfg.sparring_ratio > 0 and engine_path:
         engine = UCIEngine(engine_path, cfg.uci_engine_depth)
 
     try:
-        for _ in range(cfg.selfplay_games_per_iter):
+        for _ in range(n_games):
             if engine and random.random() < cfg.sparring_ratio:
                 out.extend(game_vs_engine(model, cfg, engine))
             else:
-                out.extend(self_play_game(model, cfg))
+                out.extend(self_play_game(model, cfg, save_pgn=False))
     finally:
         if engine:
             engine.close()
+
+    return out
+
+def generate_samples(model: PVNet, cfg: Config) -> List[Sample]:
+    """
+    Genererar samples. Om cfg.workers > 0 => multiprocessing (CPU).
+    PGN sparas bara från huvudprocessen (inte workers).
+    """
+    model.eval()
+
+    # Single-process (eller GPU-läge)
+    if cfg.workers <= 0 or cfg.device == "cuda":
+        out: List[Sample] = []
+        engine = None
+        engine_path = cfg.uci_engine_path or os.getenv("UCI_ENGINE_PATH", "")
+        if cfg.sparring_ratio > 0 and engine_path:
+            engine = UCIEngine(engine_path, cfg.uci_engine_depth)
+
+        try:
+            for gi in range(cfg.selfplay_games_per_iter):
+                # spara PGN bara här
+                save_pgn = cfg.save_last_pgn and (gi == cfg.selfplay_games_per_iter - 1)
+                if engine and random.random() < cfg.sparring_ratio:
+                    out.extend(game_vs_engine(model, cfg, engine))
+                else:
+                    out.extend(self_play_game(model, cfg, save_pgn=save_pgn))
+        finally:
+            if engine:
+                engine.close()
+        return out
+
+    # Multiprocessing på CPU
+    # 1) ta snapshot av modellvikter (CPU) som skickas till workers
+    state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+    cfg_dict = asdict(cfg)
+    # workers får inte försöka spara PGN
+    cfg_dict["save_last_pgn"] = False
+    cfg_dict["device"] = "cpu"
+
+    # 2) dela upp games i chunks
+    total_games = cfg.selfplay_games_per_iter
+    chunk = max(1, int(cfg.mp_chunk_games))
+    jobs = []
+    seed_base = random.randint(0, 2_000_000_000)
+
+    left = total_games
+    job_i = 0
+    while left > 0:
+        n = min(chunk, left)
+        jobs.append((state_dict_cpu, cfg_dict, n, seed_base + job_i, True))
+        left -= n
+        job_i += 1
+
+    ctx = mp.get_context(cfg.mp_start_method)
+    out: List[Sample] = []
+    with ctx.Pool(processes=cfg.workers) as pool:
+        for chunk_samples in pool.imap_unordered(_worker_generate_samples, jobs):
+            out.extend(chunk_samples)
+
+    # 3) spara senaste PGN i huvudprocessen (1 spel) om aktiverat
+    if cfg.save_last_pgn:
+        try:
+            # kör ett extra self-play lokalt bara för PGN (liten overhead men enkelt)
+            _ = self_play_game(model, cfg, save_pgn=True)
+        except Exception:
+            pass
 
     return out
 

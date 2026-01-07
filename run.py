@@ -21,6 +21,11 @@ def main():
     p.add_argument("--save-last-pgn", action="store_true")
     p.add_argument("--pgn-path", default="last_game.pgn")
 
+    # multiprocessing
+    p.add_argument("--workers", type=int, default=0)  # 0 = av
+    p.add_argument("--mp-start", default="spawn", choices=["spawn", "fork", "forkserver"])
+    p.add_argument("--mp-chunk-games", type=int, default=2)
+
     args = p.parse_args()
 
     cfg = Config(
@@ -35,11 +40,19 @@ def main():
         log_every=args.log_every,
         save_last_pgn=args.save_last_pgn,
         pgn_path=args.pgn_path,
+        workers=args.workers,
+        mp_start_method=args.mp_start,
+        mp_chunk_games=args.mp_chunk_games,
     )
 
-    if cfg.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA valdes men finns inte tillgängligt. Byter till CPU.")
-        cfg.device = "cpu"
+    if cfg.device == "cuda":
+        if not torch.cuda.is_available():
+            print("CUDA valdes men finns inte tillgängligt. Byter till CPU.")
+            cfg.device = "cpu"
+        # rekommenderat
+        if cfg.workers > 0:
+            print("Tips: GPU + multiprocessing kan strula. Sätter workers=0.")
+            cfg.workers = 0
 
     run_training(cfg)
 
